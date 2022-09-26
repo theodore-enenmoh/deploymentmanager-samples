@@ -1,0 +1,8 @@
+imports:
+- path: uptime_check_configs.jinja
+
+resources:
+- name: uptime_check_config
+  type: uptime_check_configs.jinja
+  properties:
+    timeout: 10s

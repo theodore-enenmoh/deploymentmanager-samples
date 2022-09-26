@@ -1,0 +1,17 @@
+imports:
+- path: tpu.py
+
+resources:
+- name: tpu
+  type: tpu.py
+  properties:
+    zone: SPECIFY_ZONE
+    acceleratorType: v2-8
+    tensorflowVersion: "2.3"
+    cidrBlock: 10.27.101.0/29
+    # If network is not present it will default to `default`
+    network: SPECIFY_NETWORK
+    
+    # If bucket is specified, the service account created with the TPU node
+    # will be granted access to the bucket here.
+    gcsBucket: SPECIFY_BUCKET

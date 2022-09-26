@@ -1,0 +1,319 @@
+# Copyright 2019 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Determine region
+{% set region_ext = properties['zone'].split('-')[0] ~ '-' ~ properties['zone'].split('-')[1] %}
+
+{% set max_gb_per_vm = 263168 %}
+{% set max_gb_per_pd = 64000 %}
+{% set max_gb_per_localssd = 9000 %}
+
+resources:
+# If we're not using an existing VPC, create a VPC, subnet and firewall rules
+{% if not properties['vpc_net'] %}
+# Split the subnet CIDR range into octets
+{% set subnet = properties['cidr'].split('/')[0] %}
+{% set subnet_split = subnet.split('.') %}
+# Create a network for the new cluster
+- name: {{properties["cluster_name"]}}-lustre-network
+  type: compute.v1.network
+  properties:
+    autoCreateSubnetworks: false
+{% endif %}
+
+{% if not properties['vpc_subnet'] %}
+# Create a subnet for the new cluster
+- name: {{properties["cluster_name"]}}-lustre-subnet
+  type: compute.v1.subnetwork
+  properties:
+    network: $(ref.{{properties["cluster_name"]}}-lustre-network.selfLink)
+    ipCidrRange: {{ properties["cidr"]}}
+    region: {{ region_ext }}
+    privateIpGoogleAccess: TRUE
+
+# Create a firewall rule to allow SSH to the cluster
+- name: {{properties["cluster_name"]}}-ssh-firewall-rule
+  type: compute.v1.firewall
+  properties:
+    network: $(ref.{{properties["cluster_name"]}}-lustre-network.selfLink)
+    sourceRanges: ["0.0.0.0/0"]
+    allowed:
+    - IPProtocol: TCP
+      ports: ["22"]
+    - IPProtocol: ICMP
+
+# Create firewall rule to allow all internal traffic between nodes
+- name: {{properties["cluster_name"]}}-all-internal-firewall-rule
+  type: compute.v1.firewall
+  properties:
+    network: $(ref.{{properties["cluster_name"]}}-lustre-network.selfLink)
+    sourceRanges: [{{properties["cidr"]}}]
+    allowed:
+    - IPProtocol: TCP
+      ports: ["0-65535"]
+    - IPProtocol: UDP
+      ports: ["0-65535"]
+    - IPProtocol: ICMP
+{% endif %}
+
+#{% if not properties['external_compute_ips'] %}
+#- name: {{properties["cluster_name"]}}-no-ip-internet-route
+#  type: compute.v1.route
+#  properties:
+#    network: $(ref.{{properties["cluster_name"]}}-exascaler-network.selfLink)
+#    tags: ["es-noip"]
+#    destRange: 0.0.0.0/0
+#    nextHopInstance: https://www.googleapis.com/compute/v1/projects/{{ env["project"] }}/zones/{{ properties["zone"] }}/instances/{{properties["cluster_name"]}}-mgs
+#    priority: 800
+#  metadata:
+#    dependsOn:
+#    - {{properties["cluster_name"]}}-mgs
+#{% endif %}
+
+# If we're not using external IPs or an existing VPC, create a Cloud NAT
+{% if (not properties['external_ips'] and not properties['vpc_net']) %}
+- name: {{properties["cluster_name"]}}-router
+  type: compute.beta.router
+  properties:
+    network: $(ref.{{properties["cluster_name"]}}-lustre-network.selfLink)
+    region: {{ region_ext }}
+    nats:
+    - name: {{properties["cluster_name"]}}-nat
+      natIpAllocateOption: "AUTO_ONLY"
+      sourceSubnetworkIpRangesToNat: "LIST_OF_SUBNETWORKS"
+      subnetworks:
+      - name: $(ref.{{properties["cluster_name"]}}-lustre-subnet.selfLink)
+        sourceIpRangesToNat: ["PRIMARY_IP_RANGE"]
+{% endif %}
+
+# Create N MDS/MGS nodes
+{% for n in range(properties['mds_node_count']) %}
+- name: {{properties["cluster_name"]}}-mds{{ n + 1 }}
+  type: compute.v1.instance
+  properties:
+    zone: {{ properties["zone"] }}
+    machineType: https://www.googleapis.com/compute/v1/projects/{{ env["project"] }}/zones/{{ properties["zone"] }}/machineTypes/{{ properties["mds_machine_type"] }}
+    disks:
+    - deviceName: boot
+      type: PERSISTENT
+      boot: true
+      autoDelete: true
+      initializeParams:
+        sourceImage: https://www.googleapis.com/compute/v1/projects/centos-cloud/global/images/family/centos-7
+        diskType: https://www.googleapis.com/compute/v1/projects/{{ env["project"] }}/zones/{{ properties["zone"] }}/diskTypes/{{ properties["mds_boot_disk_type"] }}
+        diskSizeGb: {{ properties["mds_boot_disk_size_gb"] }}
+    {% if properties["mdt_disk_type"] == "local-ssd" %}
+    {% if (properties["mdt_disk_size_gb"]|int) <= 3000 %}
+    {% set mdt_per_mds = (properties['mdt_disk_size_gb'] / 375)|round(0, 'ceil')|int %}
+    {% elif (properties["mdt_disk_size_gb"]|int) <= 6000 %}
+    {% set mdt_per_mds = 16 %}
+    {% elif (properties["mdt_disk_size_gb"]|int) <= max_gb_per_localssd %}
+    {% set mdt_per_mds = 24 %}
+    {% elif (properties["mdt_disk_size_gb"]|int) > max_gb_per_localssd %}
+    {% set mdt_per_mds = 24 %}
+    {% endif %}
+    {% for i in range(mdt_per_mds) %}
+    - type: SCRATCH
+      autoDelete: true
+      interface: NVME
+      initializeParams:
+        diskType: https://www.googleapis.com/compute/v1/projects/{{ env["project"] }}/zones/{{ properties["zone"] }}/diskTypes/{{ properties["mdt_disk_type"] }}
+    {% endfor %}
+    {% else %}
+    {% set mdt_per_mds = properties["mdt_per_mds"] %}
+    {% if properties["mdt_disk_size_gb"] > max_gb_per_pd %}
+    {% set mdt_disk_size_gb = max_gb_per_pd %}
+    {% else %}
+    {% set mdt_disk_size_gb = properties["mdt_disk_size_gb"] %}
+    {% endif %}
+    {% if mdt_per_mds*mdt_disk_size_gb > max_gb_per_vm %}
+    {% set mdt_per_mds = (max_gb_per_vm / mdt_disk_size_gb)|round(0, 'floor')|int %}
+    {% endif %}
+    {% for i in range(mdt_per_mds) %}
+    - deviceName: mdt-{{ i + 1 }}
+      type: PERSISTENT
+      autoDelete: true
+      initializeParams:
+        diskName: {{properties["cluster_name"]}}-mdt{{ n + 1 }}-{{ i + 1 }}
+        diskType: https://www.googleapis.com/compute/v1/projects/{{ env["project"] }}/zones/{{ properties["zone"] }}/diskTypes/{{ properties["mdt_disk_type"] }}
+        diskSizeGb: {{ mdt_disk_size_gb }}
+    {% endfor %}
+    {% endif %}
+{% if not properties['external_ips'] %}
+    canIpForward: true
+{% endif %}
+  {% if (properties['vpc_net'] and properties['vpc_subnet'] and properties['shared_vpc_host_proj'])  %}
+    networkInterfaces:
+    - subnetwork: https://www.googleapis.com/compute/v1/projects/{{ properties["shared_vpc_host_proj"] }}/regions/{{ region_ext }}/subnetworks/{{ properties["vpc_subnet"] }}
+  {% elif (properties['vpc_subnet'] and properties['vpc_net']) %}
+    networkInterfaces:
+    - subnetwork: https://www.googleapis.com/compute/v1/projects/{{ env["project"] }}/regions/{{ region_ext }}/subnetworks/{{ properties["vpc_subnet"] }}
+  {% else %}
+    networkInterfaces:
+    - subnetwork: $(ref.{{properties["cluster_name"]}}-lustre-subnet.selfLink)
+  {% endif %}
+  {% if properties['external_ips'] or properties['shared_vpc_host_proj'] %}
+      accessConfigs:
+      - name: External NAT
+        type: ONE_TO_ONE_NAT
+  {% endif %}
+# If the MDS IP is specified, use that
+{% if properties['mds_ip_range_start'] %}
+{% set mds_ip_split = properties['mds_ip_range_start'].split('.')[3] | int %}
+{% set mds_ip_uniq = mds_ip_split + n %}
+{% set mds_ip = subnet_split[0] ~ '.' ~ subnet_split[1] ~ '.' ~ subnet_split[2] ~ '.' ~ mds_ip_uniq %}
+      networkIP: {{ mds_ip }}
+ {% endif %}
+    serviceAccounts:
+      - email: "default"
+        scopes:
+        - "https://www.googleapis.com/auth/cloud-platform"
+    metadata:
+      dependsOn:
+        - {{properties["cluster_name"]}}-mds1
+      items:
+        - key: startup-script
+          value: |
+            {{ imports["scripts/startup-script.sh"]|indent(12)|replace("@CLUSTER_NAME@",properties["cluster_name"])|replace("@FS_NAME@",properties["fs_name"])|replace("@LUSTRE_VERSION@",properties["lustre_version"])|replace("@E2FS_VERSION@",properties["e2fs_version"])|replace("@NODE_ROLE@","MDS")|replace("@MDT_PER_MDS@",mdt_per_mds)|replace("@OST_PER_OSS@",properties["ost_per_oss"])|replace("@OST_DISK_TYPE@",properties["ost_disk_type"])|replace("@MDT_DISK_TYPE@",properties["mdt_disk_type"]) }}
+        - key: enable-oslogin
+          value: "TRUE"
+{% endfor %}
+
+# Create N OSS nodes
+{% for n in range(properties['oss_node_count']) %}
+- name: {{properties["cluster_name"]}}-oss{{ n + 1 }}
+  type: compute.v1.instance
+  properties:
+    zone: {{ properties["zone"] }}
+    machineType: https://www.googleapis.com/compute/v1/projects/{{ env["project"] }}/zones/{{ properties["zone"] }}/machineTypes/{{ properties["oss_machine_type"] }}
+    disks:
+    - deviceName: boot
+      type: PERSISTENT
+      boot: true
+      autoDelete: true
+      initializeParams:
+        sourceImage: https://www.googleapis.com/compute/v1/projects/centos-cloud/global/images/family/centos-7
+        diskType: https://www.googleapis.com/compute/v1/projects/{{ env["project"] }}/zones/{{ properties["zone"] }}/diskTypes/{{ properties["oss_boot_disk_type"] }}
+        diskSizeGb: {{ properties["oss_boot_disk_size_gb"] }}
+    {% if properties["ost_disk_type"] == "local-ssd" %}
+    {% if (properties["ost_disk_size_gb"]|int) <= 3000 %}
+    {% set ost_per_oss = (properties['ost_disk_size_gb'] / 375)|round(0, 'ceil')|int %}
+    {% elif (properties["ost_disk_size_gb"]|int) <= 6000 %}
+    {% set ost_per_oss = 16 %}
+    {% elif (properties["ost_disk_size_gb"]|int) <= max_gb_per_localssd %}
+    {% set ost_per_oss = 24 %}
+    {% elif (properties["ost_disk_size_gb"]|int) > max_gb_per_localssd %}
+    {% set ost_per_oss = 24 %}
+    {% endif %}
+    {% for i in range(ost_per_oss) %}
+    - type: SCRATCH
+      autoDelete: true
+      interface: NVME
+      initializeParams:
+        diskType: https://www.googleapis.com/compute/v1/projects/{{ env["project"] }}/zones/{{ properties["zone"] }}/diskTypes/{{ properties["ost_disk_type"] }}
+    {% endfor %}
+    {% else %}
+    {% set ost_per_oss = properties["ost_per_oss"] %}
+    {% if properties["ost_disk_size_gb"] > max_gb_per_pd %}
+    {% set ost_disk_size_gb = max_gb_per_pd %}
+    {% else %}
+    {% set ost_disk_size_gb = properties["ost_disk_size_gb"] %}
+    {% endif %}
+    {% if ost_per_oss*ost_disk_size_gb > max_gb_per_vm %}
+    {% set ost_per_oss = (max_gb_per_vm / ost_disk_size_gb)|round(0, 'floor')|int %}
+    {% endif %}
+    {% for i in range(ost_per_oss) %}
+    - deviceName: ost-{{ i + 1 }}
+      type: PERSISTENT
+      autoDelete: true
+      initializeParams:
+        diskName: {{properties["cluster_name"]}}-ost{{ n + 1 }}-{{ i + 1 }}
+        diskType: https://www.googleapis.com/compute/v1/projects/{{ env["project"] }}/zones/{{ properties["zone"] }}/diskTypes/{{ properties["ost_disk_type"] }}
+        diskSizeGb: {{ ost_disk_size_gb }}
+    {% endfor %}
+    {% endif %}
+  {% if (properties['vpc_subnet'] and properties['vpc_net'] and properties['shared_vpc_host_proj'])  %}
+    networkInterfaces:
+    - subnetwork: https://www.googleapis.com/compute/v1/projects/{{ properties["shared_vpc_host_proj"] }}/regions/{{ region_ext }}/subnetworks/{{ properties["vpc_subnet"] }}
+  {% elif (properties['vpc_subnet'] and properties['vpc_net']) %}
+    networkInterfaces:
+    - subnetwork: https://www.googleapis.com/compute/v1/projects/{{ env["project"] }}/regions/{{ region_ext }}/subnetworks/{{ properties["vpc_subnet"] }}
+  {% else %}
+    networkInterfaces:
+    - subnetwork: $(ref.{{properties["cluster_name"]}}-lustre-subnet.selfLink)
+  {% endif %}
+  {% if properties['external_ips'] or properties['shared_vpc_host_proj'] %}
+      accessConfigs:
+      - name: External NAT
+        type: ONE_TO_ONE_NAT
+  {% endif %}
+# If the range start is set, create OSS nodes with consistently sequential IPs. Otherwise use DHCP
+{% if properties['oss_ip_range_start'] %}
+{% set oss_ip_split = properties['oss_ip_range_start'].split('.')[3] | int %}
+{% set oss_ip_uniq = oss_ip_split + n %}
+{% set oss_ip = subnet_split[0] ~ '.' ~ subnet_split[1] ~ '.' ~ subnet_split[2] ~ '.' ~ oss_ip_uniq %}
+      networkIP: {{ oss_ip }}
+{% endif %}
+    serviceAccounts:
+      - email: "default"
+        scopes:
+        - "https://www.googleapis.com/auth/cloud-platform"
+    metadata:
+      items:
+        - key: startup-script
+          value: |
+            {{ imports["scripts/startup-script.sh"]|indent(12)|replace("@CLUSTER_NAME@",properties["cluster_name"])|replace("@FS_NAME@",properties["fs_name"])|replace("@LUSTRE_VERSION@",properties["lustre_version"])|replace("@E2FS_VERSION@",properties["e2fs_version"])|replace("@NODE_ROLE@","OSS")|replace("@OST_PER_OSS@",ost_per_oss)|replace("@MDT_PER_MDS@",properties["mdt_per_mds"])|replace("@OST_DISK_TYPE@",properties["ost_disk_type"])|replace("@MDT_DISK_TYPE@",properties["mdt_disk_type"])  }}
+{% endfor %}
+
+# Create N Lustre HSM Data Movers nodes
+{% for n in range(properties['hsm_node_count']) %}
+- name: {{properties["cluster_name"]}}-hsm{{ n + 1 }}
+  type: compute.v1.instance
+  properties:
+    zone: {{ properties["zone"] }}
+    machineType: https://www.googleapis.com/compute/v1/projects/{{ env["project"] }}/zones/{{ properties["zone"] }}/machineTypes/{{ properties["hsm_machine_type"] }}
+    disks:
+    - deviceName: boot
+      type: PERSISTENT
+      boot: true
+      autoDelete: true
+      initializeParams:
+        sourceImage: https://www.googleapis.com/compute/v1/projects/centos-cloud/global/images/family/centos-7
+        diskType: https://www.googleapis.com/compute/v1/projects/{{ env["project"] }}/zones/{{ properties["zone"] }}/diskTypes/{{ properties["hsm_boot_disk_type"] }}
+        diskSizeGb: {{ properties["hsm_boot_disk_size_gb"] }}
+  {% if (properties['vpc_subnet'] and properties['vpc_net'] and properties['shared_vpc_host_proj'])  %}
+    networkInterfaces:
+    - subnetwork: https://www.googleapis.com/compute/v1/projects/{{ properties["shared_vpc_host_proj"] }}/regions/{{ region_ext }}/subnetworks/{{ properties["vpc_subnet"] }}
+  {% elif (properties['vpc_subnet'] and properties['vpc_net']) %}
+    networkInterfaces:
+    - subnetwork: https://www.googleapis.com/compute/v1/projects/{{ env["project"] }}/regions/{{ region_ext }}/subnetworks/{{ properties["vpc_subnet"] }}
+  {% else %}
+    networkInterfaces:
+    - subnetwork: $(ref.{{properties["cluster_name"]}}-lustre-subnet.selfLink)
+  {% endif %}
+  {% if properties['external_ips'] or properties['shared_vpc_host_proj'] %}
+      accessConfigs:
+      - name: External NAT
+        type: ONE_TO_ONE_NAT
+  {% endif %}
+    serviceAccounts:
+      - email: "default"
+        scopes:
+        - "https://www.googleapis.com/auth/cloud-platform"
+    metadata:
+      items:
+        - key: startup-script
+          value: |
+            {{ imports["scripts/startup-script.sh"]|indent(12)|replace("@CLUSTER_NAME@",properties["cluster_name"])|replace("@FS_NAME@",properties["fs_name"])|replace("@LUSTRE_VERSION@",properties["lustre_version"])|replace("@E2FS_VERSION@",properties["e2fs_version"])|replace("@NODE_ROLE@","HSM")|replace("@HSM_GCS_BUCKET@",properties["hsm_gcs_bucket"])|replace("@HSM_GCS_BUCKET_IMPORT@",properties["hsm_gcs_bucket_import"]) }}
+{% endfor %}
